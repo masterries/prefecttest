@@ -1,0 +1,30 @@
+name: autoscout-scraper
+prefect-version: 3.x
+
+# Code wird vom Worker via Volume-Mount bereitgestellt
+pull: []
+
+deployments:
+
+  - name: scrape-all
+    description: "Scraped alle konfigurierten Fahrzeuge und schreibt in DuckDB (Bronze + Silver)"
+    entrypoint: src/flows.py:scrape_all_flow
+    work_pool:
+      name: autoscout-pool
+      work_queue_name: default
+    parameters: {}
+    schedules:
+      - cron: "0 6 * * *"   # täglich 06:00 UTC
+        timezone: "Europe/Luxembourg"
+        active: true
+
+  - name: scrape-single
+    description: "Scraped ein einzelnes Fahrzeug (make + model als Parameter)"
+    entrypoint: src/flows.py:scrape_flow
+    work_pool:
+      name: autoscout-pool
+      work_queue_name: default
+    parameters:
+      make: audi
+      model: a4
+    schedules: []
