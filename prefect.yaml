@@ -16,7 +16,7 @@ deployments:
     description: "Scraped alle konfigurierten Fahrzeuge und schreibt in DuckDB (Bronze + Silver)"
     entrypoint: src/flows.py:scrape_all_flow
     work_pool:
-      name: autoscout-pool
+      name: default-agent-pool
       work_queue_name: default
     parameters: {}
     schedules:
@@ -28,7 +28,7 @@ deployments:
     description: "Scraped ein einzelnes Fahrzeug (make + model als Parameter)"
     entrypoint: src/flows.py:scrape_flow
     work_pool:
-      name: autoscout-pool
+      name: default-agent-pool
       work_queue_name: default
     parameters:
       make: audi
