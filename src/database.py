@@ -1,65 +1,62 @@
 import os
-from pathlib import Path
 
-import duckdb
+import psycopg2
+import psycopg2.extras
 
 from .models import Listing, PriceChange
 
-_DEFAULT_DB = Path(__file__).parent.parent / "data" / "autoscout.duckdb"
-DB_PATH = Path(os.environ.get("AUTOSCOUT_DB_PATH", str(_DEFAULT_DB)))
+DATABASE_URL = os.environ["DATABASE_URL"]
 
 
-def get_connection() -> duckdb.DuckDBPyConnection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return duckdb.connect(str(DB_PATH))
+def get_connection() -> psycopg2.extensions.connection:
+    return psycopg2.connect(DATABASE_URL)
 
 
-def create_tables(con: duckdb.DuckDBPyConnection) -> None:
-    # Bronze layer — append-only source of truth, one row per listing per run
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS raw_listings (
-            run_id             VARCHAR NOT NULL,
-            guid               VARCHAR NOT NULL,
-            make               VARCHAR NOT NULL,
-            model              VARCHAR NOT NULL,
-            price              INTEGER,
-            mileage            INTEGER,
-            fuel_type          VARCHAR,
-            first_registration VARCHAR,
-            seller_type        VARCHAR,
-            url                VARCHAR,
-            scraped_at         TIMESTAMPTZ NOT NULL
-        )
-    """)
-    # Silver layer — current state, upserted on every run
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS listings (
-            guid             VARCHAR PRIMARY KEY,
-            make             VARCHAR NOT NULL,
-            model            VARCHAR NOT NULL,
-            price            INTEGER,
-            mileage          INTEGER,
-            fuel_type        VARCHAR,
-            first_registration VARCHAR,
-            seller_type      VARCHAR,
-            url              VARCHAR,
-            scraped_at       TIMESTAMPTZ NOT NULL
-        )
-    """)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS price_changes (
-            guid         VARCHAR NOT NULL,
-            old_price    INTEGER,
-            new_price    INTEGER,
-            detected_at  TIMESTAMPTZ NOT NULL
-        )
-    """)
+def create_tables(con: psycopg2.extensions.connection) -> None:
+    with con.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS raw_listings (
+                run_id             VARCHAR NOT NULL,
+                guid               VARCHAR NOT NULL,
+                make               VARCHAR NOT NULL,
+                model              VARCHAR NOT NULL,
+                price              INTEGER,
+                mileage            INTEGER,
+                fuel_type          VARCHAR,
+                first_registration VARCHAR,
+                seller_type        VARCHAR,
+                url                VARCHAR,
+                scraped_at         TIMESTAMPTZ NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS listings (
+                guid               VARCHAR PRIMARY KEY,
+                make               VARCHAR NOT NULL,
+                model              VARCHAR NOT NULL,
+                price              INTEGER,
+                mileage            INTEGER,
+                fuel_type          VARCHAR,
+                first_registration VARCHAR,
+                seller_type        VARCHAR,
+                url                VARCHAR,
+                scraped_at         TIMESTAMPTZ NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS price_changes (
+                guid        VARCHAR NOT NULL,
+                old_price   INTEGER,
+                new_price   INTEGER,
+                detected_at TIMESTAMPTZ NOT NULL
+            )
+        """)
+    con.commit()
 
 
 def save_raw_listings(
-    con: duckdb.DuckDBPyConnection, listings: list[Listing], run_id: str
+    con: psycopg2.extensions.connection, listings: list[Listing], run_id: str
 ) -> int:
-    """Append all scraped listings to the Bronze layer. Never updates existing rows."""
     if not listings:
         return 0
 
@@ -71,36 +68,40 @@ def save_raw_listings(
         )
         for l in listings
     ]
-    con.executemany(
-        "INSERT INTO raw_listings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        rows,
-    )
+    with con.cursor() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO raw_listings VALUES %s",
+            rows,
+        )
+    con.commit()
     return len(rows)
 
 
 def detect_price_changes(
-    con: duckdb.DuckDBPyConnection, listings: list[Listing]
+    con: psycopg2.extensions.connection, listings: list[Listing]
 ) -> list[PriceChange]:
-    """Compare incoming listings against stored prices. Call BEFORE save_listings."""
     if not listings:
         return []
 
-    con.execute("CREATE OR REPLACE TEMP TABLE _incoming (guid VARCHAR, new_price INTEGER)")
-    con.executemany(
-        "INSERT INTO _incoming VALUES (?, ?)",
-        [(l.guid, l.price) for l in listings if l.price is not None],
-    )
+    incoming = [(l.guid, l.price) for l in listings if l.price is not None]
 
-    rows = con.execute("""
-        SELECT
-            existing.guid,
-            existing.price  AS old_price,
-            inc.new_price,
-            NOW()           AS detected_at
-        FROM listings existing
-        JOIN _incoming inc ON existing.guid = inc.guid
-        WHERE existing.price IS DISTINCT FROM inc.new_price
-    """).fetchall()
+    with con.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS _incoming")
+        cur.execute("CREATE TEMP TABLE _incoming (guid VARCHAR, new_price INTEGER)")
+        psycopg2.extras.execute_values(cur, "INSERT INTO _incoming VALUES %s", incoming)
+
+        cur.execute("""
+            SELECT
+                existing.guid,
+                existing.price  AS old_price,
+                inc.new_price,
+                NOW()           AS detected_at
+            FROM listings existing
+            JOIN _incoming inc ON existing.guid = inc.guid
+            WHERE existing.price IS DISTINCT FROM inc.new_price
+        """)
+        rows = cur.fetchall()
 
     if not rows:
         return []
@@ -110,15 +111,17 @@ def detect_price_changes(
         for r in rows
     ]
 
-    con.executemany(
-        "INSERT INTO price_changes VALUES (?, ?, ?, ?)",
-        [(pc.guid, pc.old_price, pc.new_price, pc.detected_at) for pc in changes],
-    )
-
+    with con.cursor() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            "INSERT INTO price_changes VALUES %s",
+            [(pc.guid, pc.old_price, pc.new_price, pc.detected_at) for pc in changes],
+        )
+    con.commit()
     return changes
 
 
-def save_listings(con: duckdb.DuckDBPyConnection, listings: list[Listing]) -> int:
+def save_listings(con: psycopg2.extensions.connection, listings: list[Listing]) -> int:
     if not listings:
         return 0
 
@@ -130,16 +133,20 @@ def save_listings(con: duckdb.DuckDBPyConnection, listings: list[Listing]) -> in
         )
         for l in listings
     ]
-
-    con.executemany("""
-        INSERT INTO listings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT (guid) DO UPDATE SET
-            price              = EXCLUDED.price,
-            mileage            = EXCLUDED.mileage,
-            fuel_type          = EXCLUDED.fuel_type,
-            first_registration = EXCLUDED.first_registration,
-            seller_type        = EXCLUDED.seller_type,
-            scraped_at         = EXCLUDED.scraped_at
-    """, rows)
-
+    with con.cursor() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO listings VALUES %s
+            ON CONFLICT (guid) DO UPDATE SET
+                price              = EXCLUDED.price,
+                mileage            = EXCLUDED.mileage,
+                fuel_type          = EXCLUDED.fuel_type,
+                first_registration = EXCLUDED.first_registration,
+                seller_type        = EXCLUDED.seller_type,
+                scraped_at         = EXCLUDED.scraped_at
+            """,
+            rows,
+        )
+    con.commit()
     return len(rows)
