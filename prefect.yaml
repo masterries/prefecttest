@@ -6,8 +6,7 @@ pull:
       repository: https://github.com/masterries/prefecttest.git
       branch: main
   - prefect.deployments.steps.pip_install_requirements:
-      directory: "{{ git_clone.directory }}"
-      requirements_file: requirements.txt
+      requirements_file: "{{ git_clone.directory }}/requirements.txt"
 
 deployments:
 
