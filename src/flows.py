@@ -105,15 +105,17 @@ async def scrape_flow(make: str, model: str) -> None:
         )
 
 
+from datetime import datetime
+
+def generate_all_flow_name() -> str:
+    return f"scrape-all-{datetime.now():%Y-%m-%d-%H%M}"
+
 @flow(
     log_prints=True,
-    flow_run_name="scrape-all-{date:%Y-%m-%d}"
+    flow_run_name=generate_all_flow_name
 )
 async def scrape_all_flow(vehicles: list[tuple[str, str]] = VEHICLES) -> None:
     """Scrape multiple make/model combinations sequentially."""
-    from datetime import datetime
-    if date is None:
-        date = datetime.now()
     print(f"Starting scrape for {len(vehicles)} vehicle(s).")
     for make, model in vehicles:
         print(f"--- {make} {model} ---")
