@@ -1,8 +1,13 @@
 name: autoscout-scraper
 prefect-version: 3.x
 
-# Code wird vom Worker via Volume-Mount bereitgestellt
-pull: []
+pull:
+  - prefect.deployments.steps.git_clone:
+      repository: https://github.com/masterries/prefecttest.git
+      branch: main
+  - prefect.deployments.steps.pip_install_requirements:
+      directory: "{{ git_clone.directory }}"
+      requirements_file: requirements.txt
 
 deployments:
 
