@@ -125,6 +125,11 @@ def save_listings(con: psycopg2.extensions.connection, listings: list[Listing]) 
     if not listings:
         return 0
 
+    seen: dict[str, Listing] = {}
+    for l in listings:
+        seen[l.guid] = l
+    listings = list(seen.values())
+
     rows = [
         (
             l.guid, l.make, l.model, l.price, l.mileage,
