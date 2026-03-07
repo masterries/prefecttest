@@ -46,7 +46,10 @@ def persist_listings_task(listings: list[Listing], run_id: str) -> tuple[int, li
         con.close()
 
 
-@flow(log_prints=True)
+@flow(
+    log_prints=True,
+    flow_run_name="{make}-{model}"
+)
 async def scrape_flow(make: str, model: str) -> None:
     import os
     print(f"DATABASE_URL = {os.environ.get('DATABASE_URL', 'NOT SET')}")
@@ -102,7 +105,10 @@ async def scrape_flow(make: str, model: str) -> None:
         )
 
 
-@flow(log_prints=True)
+@flow(
+    log_prints=True,
+    flow_run_name="scrape-all-{date:%Y-%m-%d}"
+)
 async def scrape_all_flow(vehicles: list[tuple[str, str]] = VEHICLES) -> None:
     """Scrape multiple make/model combinations sequentially."""
     print(f"Starting scrape for {len(vehicles)} vehicle(s).")

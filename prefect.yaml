@@ -18,9 +18,6 @@ deployments:
     work_pool:
       name: default-agent-pool
       work_queue_name: default
-      job_variables:
-        env:
-          DATABASE_URL: "{{ $DATABASE_URL }}"
     parameters: {}
     schedules:
       - cron: "0 6 * * *"
@@ -33,9 +30,6 @@ deployments:
     work_pool:
       name: default-agent-pool
       work_queue_name: default
-      job_variables:
-        env:
-          DATABASE_URL: "{{ $DATABASE_URL }}"
     parameters:
       make: audi
       model: a4
