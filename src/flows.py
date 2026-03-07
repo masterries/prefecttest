@@ -48,6 +48,8 @@ def persist_listings_task(listings: list[Listing], run_id: str) -> tuple[int, li
 
 @flow(log_prints=True)
 async def scrape_flow(make: str, model: str) -> None:
+    import os
+    print(f"DATABASE_URL = {os.environ.get('DATABASE_URL', 'NOT SET')}")
     logger = get_run_logger()
     run_id = str(flow_run.id)
     all_listings: list[Listing] = []
