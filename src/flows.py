@@ -1,4 +1,5 @@
 import httpx
+from datetime import datetime
 from prefect import flow, task
 from prefect.artifacts import create_markdown_artifact, create_table_artifact
 from prefect.logging import get_run_logger
@@ -12,6 +13,7 @@ from .database import (
     save_raw_listings,
 )
 from .extractors import fetch_page, parse_listings
+from .lineage import LineageTracker
 from .models import Listing, PriceChange
 
 # Fahrzeugliste für scrape_all_flow
@@ -51,64 +53,84 @@ def persist_listings_task(listings: list[Listing], run_id: str) -> tuple[int, li
     flow_run_name="{make}-{model}"
 )
 async def scrape_flow(make: str, model: str) -> None:
-    import os
-    print(f"DATABASE_URL = {os.environ.get('DATABASE_URL', 'NOT SET')}")
     logger = get_run_logger()
     run_id = str(flow_run.id)
     all_listings: list[Listing] = []
 
-    page = 1
-    while True:
-        html = await fetch_page_task(make, model, page)
-        listings = parse_listings_task(html, make, model)
-
-        if not listings:
-            print(f"Page {page}: empty — stopping pagination.")
-            break
-
-        print(f"Page {page}: {len(listings)} listings parsed.")
-        all_listings.extend(listings)
-        page += 1
-
-    if not all_listings:
-        print("No listings found.")
-        return
-
-    saved, changes = persist_listings_task(all_listings, run_id)
-    print(f"Saved/updated {saved} listings. Price changes detected: {len(changes)}.")
-
-    for ch in changes:
-        print(f"  {ch.guid}: {ch.old_price} -> {ch.new_price}")
-
-    await create_table_artifact(
-        key="listings-sample",
-        table=[
-            {
-                "guid": l.guid,
-                "price": l.price,
-                "mileage": l.mileage,
-                "fuel_type": l.fuel_type,
-                "first_registration": l.first_registration,
-                "seller_type": l.seller_type,
-            }
-            for l in all_listings[:25]
+    # --- Lineage: START ---
+    tracker = LineageTracker()
+    tracker.start_run(
+        job_name=f"scrape-{make}-{model}",
+        run_id=run_id,
+        inputs=[],
+        outputs=[
+            "postgres.raw_listings",
+            "postgres.listings",
+            "postgres.price_changes",
         ],
-        description=f"First 25 of {len(all_listings)} listings for {make} {model}",
     )
 
-    if changes:
-        rows = "\n".join(f"| {c.guid} | {c.old_price}€ | {c.new_price}€ |" for c in changes)
-        await create_markdown_artifact(
-            key="price-changes",
-            markdown=f"## Price Changes ({make} {model})\n\n| GUID | Old Price | New Price |\n|------|-----------|----------|\n{rows}",
-            description=f"{len(changes)} price changes detected",
+    try:
+        page = 1
+        while True:
+            html = await fetch_page_task(make, model, page)
+            listings = parse_listings_task(html, make, model)
+
+            if not listings:
+                print(f"Page {page}: empty — stopping pagination.")
+                break
+
+            print(f"Page {page}: {len(listings)} listings parsed.")
+            all_listings.extend(listings)
+            page += 1
+
+        if not all_listings:
+            print("No listings found.")
+            tracker.complete_run()
+            return
+
+        saved, changes = persist_listings_task(all_listings, run_id)
+        print(f"Saved/updated {saved} listings. Price changes detected: {len(changes)}.")
+
+        for ch in changes:
+            print(f"  {ch.guid}: {ch.old_price} -> {ch.new_price}")
+
+        await create_table_artifact(
+            key="listings-sample",
+            table=[
+                {
+                    "guid": l.guid,
+                    "price": l.price,
+                    "mileage": l.mileage,
+                    "fuel_type": l.fuel_type,
+                    "first_registration": l.first_registration,
+                    "seller_type": l.seller_type,
+                }
+                for l in all_listings[:25]
+            ],
+            description=f"First 25 of {len(all_listings)} listings for {make} {model}",
         )
 
+        if changes:
+            rows = "\n".join(f"| {c.guid} | {c.old_price}€ | {c.new_price}€ |" for c in changes)
+            await create_markdown_artifact(
+                key="price-changes",
+                markdown=f"## Price Changes ({make} {model})\n\n| GUID | Old Price | New Price |\n|------|-----------|----------|\n{rows}",
+                description=f"{len(changes)} price changes detected",
+            )
 
-from datetime import datetime
+        # --- Lineage: COMPLETE ---
+        tracker.complete_run()
+
+    except Exception as e:
+        # --- Lineage: FAIL ---
+        tracker.fail_run(error_message=str(e))
+        raise
+
 
 def generate_all_flow_name() -> str:
     return f"scrape-all-{datetime.now():%Y-%m-%d-%H%M}"
+
 
 @flow(
     log_prints=True,
@@ -116,8 +138,30 @@ def generate_all_flow_name() -> str:
 )
 async def scrape_all_flow(vehicles: list[tuple[str, str]] = VEHICLES) -> None:
     """Scrape multiple make/model combinations sequentially."""
-    print(f"Starting scrape for {len(vehicles)} vehicle(s).")
-    for make, model in vehicles:
-        print(f"--- {make} {model} ---")
-        await scrape_flow(make=make, model=model)
-    print("All vehicles scraped.")
+
+    # --- Lineage: START ---
+    tracker = LineageTracker()
+    tracker.start_run(
+        job_name="scrape-all",
+        inputs=[],
+        outputs=[
+            "postgres.raw_listings",
+            "postgres.listings",
+            "postgres.price_changes",
+        ],
+    )
+
+    try:
+        print(f"Starting scrape for {len(vehicles)} vehicle(s).")
+        for make, model in vehicles:
+            print(f"--- {make} {model} ---")
+            await scrape_flow(make=make, model=model)
+        print("All vehicles scraped.")
+
+        # --- Lineage: COMPLETE ---
+        tracker.complete_run()
+
+    except Exception as e:
+        # --- Lineage: FAIL ---
+        tracker.fail_run(error_message=str(e))
+        raise

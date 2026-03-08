@@ -4,3 +4,4 @@ selectolax>=0.3
 psycopg2-binary>=2.9
 pydantic>=2.0
 click>=8.0
+openlineage-python>=1.40.0
