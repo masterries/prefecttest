@@ -1,209 +1,167 @@
-"""
-OpenLineage integration for Prefect flows.
+import httpx
+from datetime import datetime
+from prefect import flow, task
+from prefect.artifacts import create_markdown_artifact, create_table_artifact
+from prefect.logging import get_run_logger
+from prefect.runtime import flow_run
 
-Sends lineage events to Marquez so you can track which flows
-read/write which datasets (tables).
+from .database import (
+    create_tables,
+    detect_price_changes,
+    get_connection,
+    save_listings,
+    save_raw_listings,
+)
+from .extractors import fetch_page, parse_listings
+from .lineage import LineageTracker
+from .models import Listing, PriceChange
 
-Usage in flows.py:
-    from .lineage import LineageTracker
+# Fahrzeugliste für scrape_all_flow
+VEHICLES: list[tuple[str, str]] = [
+    ("audi", "a4"),
+    ("volkswagen", "golf"),
+    ("bmw", "3er"),
+]
 
+
+@task(retries=3, retry_delay_seconds=15)
+async def fetch_page_task(make: str, model: str, page: int) -> str:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await fetch_page(client, make, model, page)
+
+
+@task
+def parse_listings_task(html: str, make: str, model: str) -> list[Listing]:
+    return parse_listings(html, make, model)
+
+
+@task
+def persist_listings_task(listings: list[Listing], run_id: str) -> tuple[int, list[PriceChange]]:
+    con = get_connection()
+    try:
+        create_tables(con)
+        save_raw_listings(con, listings, run_id)      # Bronze — append-only
+        changes = detect_price_changes(con, listings)  # Silver prep
+        saved = save_listings(con, listings)           # Silver — current state
+        return saved, changes
+    finally:
+        con.close()
+
+
+@flow(
+    log_prints=True,
+    flow_run_name="{make}-{model}"
+)
+async def scrape_flow(make: str, model: str) -> None:
+    logger = get_run_logger()
+    run_id = str(flow_run.id)
+    all_listings: list[Listing] = []
+
+    # --- Lineage: START ---
     tracker = LineageTracker()
-
-    # At the start of your flow:
     tracker.start_run(
-        job_name="scrape-flow-audi-a4",
+        job_name=f"scrape-{make}-{model}",
+        run_id=run_id,
         inputs=[],
-        outputs=["default.raw_listings", "default.listings", "default.price_changes"]
+        outputs=[
+            "postgres.raw_listings",
+            "postgres.listings",
+            "postgres.price_changes",
+        ],
     )
 
-    # ... do your work ...
+    try:
+        page = 1
+        while True:
+            html = await fetch_page_task(make, model, page)
+            listings = parse_listings_task(html, make, model)
 
-    # On success:
-    tracker.complete_run()
+            if not listings:
+                print(f"Page {page}: empty — stopping pagination.")
+                break
 
-    # On failure:
-    tracker.fail_run(error_message="Something went wrong")
-"""
+            print(f"Page {page}: {len(listings)} listings parsed.")
+            all_listings.extend(listings)
+            page += 1
 
-import os
-import uuid
-from datetime import datetime, timezone
-from typing import Optional
+        if not all_listings:
+            print("No listings found.")
+            tracker.complete_run()
+            return
 
-from openlineage.client import OpenLineageClient
-from openlineage.client.facet import (
-    SchemaDatasetFacet,
-    SchemaDatasetFacetFields,
-    SourceCodeLocationJobFacet,
-    SqlJobFacet,
-)
-from openlineage.client.event_v2 import (
-    Dataset,
-    InputDataset,
-    Job,
-    OutputDataset,
-    Run,
-    RunEvent,
-    RunState,
-)
-from openlineage.client.transport.http import HttpConfig, HttpTransport
+        saved, changes = persist_listings_task(all_listings, run_id)
+        print(f"Saved/updated {saved} listings. Price changes detected: {len(changes)}.")
 
-# Configure via env vars, with sensible defaults
-MARQUEZ_URL = os.environ.get("OPENLINEAGE_URL", "http://marquez-api:5000")
-NAMESPACE = os.environ.get("OPENLINEAGE_NAMESPACE", "prefect")
+        for ch in changes:
+            print(f"  {ch.guid}: {ch.old_price} -> {ch.new_price}")
 
+        await create_table_artifact(
+            key="listings-sample",
+            table=[
+                {
+                    "guid": l.guid,
+                    "price": l.price,
+                    "mileage": l.mileage,
+                    "fuel_type": l.fuel_type,
+                    "first_registration": l.first_registration,
+                    "seller_type": l.seller_type,
+                }
+                for l in all_listings[:25]
+            ],
+            description=f"First 25 of {len(all_listings)} listings for {make} {model}",
+        )
 
-# Schema definitions for our tables
-TABLE_SCHEMAS = {
-    "raw_listings": SchemaDatasetFacet(
-        fields=[
-            SchemaDatasetFacetFields(name="run_id", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="guid", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="make", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="model", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="price", type="INTEGER"),
-            SchemaDatasetFacetFields(name="mileage", type="INTEGER"),
-            SchemaDatasetFacetFields(name="fuel_type", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="first_registration", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="seller_type", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="url", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="scraped_at", type="TIMESTAMPTZ"),
-        ]
-    ),
-    "listings": SchemaDatasetFacet(
-        fields=[
-            SchemaDatasetFacetFields(name="guid", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="make", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="model", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="price", type="INTEGER"),
-            SchemaDatasetFacetFields(name="mileage", type="INTEGER"),
-            SchemaDatasetFacetFields(name="fuel_type", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="first_registration", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="seller_type", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="url", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="scraped_at", type="TIMESTAMPTZ"),
-        ]
-    ),
-    "price_changes": SchemaDatasetFacet(
-        fields=[
-            SchemaDatasetFacetFields(name="guid", type="VARCHAR"),
-            SchemaDatasetFacetFields(name="old_price", type="INTEGER"),
-            SchemaDatasetFacetFields(name="new_price", type="INTEGER"),
-            SchemaDatasetFacetFields(name="detected_at", type="TIMESTAMPTZ"),
-        ]
-    ),
-}
-
-
-def _get_table_name(full_name: str) -> str:
-    """Extract table name from 'db.table' format."""
-    return full_name.split(".")[-1]
-
-
-class LineageTracker:
-    """Tracks OpenLineage events for Prefect flows."""
-
-    def __init__(self, marquez_url: str = MARQUEZ_URL, namespace: str = NAMESPACE):
-        self.namespace = namespace
-        self.run_id: Optional[str] = None
-        self.job_name: Optional[str] = None
-        self._inputs: list[InputDataset] = []
-        self._outputs: list[OutputDataset] = []
-
-        try:
-            http_config = HttpConfig(url=marquez_url)
-            transport = HttpTransport(http_config)
-            self.client = OpenLineageClient(transport=transport)
-        except Exception as e:
-            print(f"[LineageTracker] Warning: Could not connect to Marquez at {marquez_url}: {e}")
-            self.client = None
-
-    def start_run(
-        self,
-        job_name: str,
-        inputs: list[str] | None = None,
-        outputs: list[str] | None = None,
-        run_id: str | None = None,
-    ) -> str:
-        """Emit a START event. Returns the run_id."""
-        self.run_id = run_id or str(uuid.uuid4())
-        self.job_name = job_name
-
-        self._inputs = []
-        for ds_name in (inputs or []):
-            table = _get_table_name(ds_name)
-            schema = TABLE_SCHEMAS.get(table)
-            facets = {"schema": schema} if schema else {}
-            self._inputs.append(
-                InputDataset(namespace=self.namespace, name=ds_name, facets=facets)
+        if changes:
+            rows = "\n".join(f"| {c.guid} | {c.old_price}€ | {c.new_price}€ |" for c in changes)
+            await create_markdown_artifact(
+                key="price-changes",
+                markdown=f"## Price Changes ({make} {model})\n\n| GUID | Old Price | New Price |\n|------|-----------|----------|\n{rows}",
+                description=f"{len(changes)} price changes detected",
             )
 
-        self._outputs = []
-        for ds_name in (outputs or []):
-            table = _get_table_name(ds_name)
-            schema = TABLE_SCHEMAS.get(table)
-            facets = {"schema": schema} if schema else {}
-            self._outputs.append(
-                OutputDataset(namespace=self.namespace, name=ds_name, facets=facets)
-            )
+        # --- Lineage: COMPLETE ---
+        tracker.complete_run()
 
-        event = RunEvent(
-            eventType=RunState.START,
-            eventTime=datetime.now(timezone.utc).isoformat(),
-            run=Run(runId=self.run_id),
-            job=Job(namespace=self.namespace, name=job_name),
-            inputs=self._inputs,
-            outputs=self._outputs,
-            producer="https://github.com/masterries/prefecttest",
-            schemaURL="https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
-        )
+    except Exception as e:
+        # --- Lineage: FAIL ---
+        tracker.fail_run(error_message=str(e))
+        raise
 
-        self._emit(event)
-        return self.run_id
 
-    def complete_run(self) -> None:
-        """Emit a COMPLETE event."""
-        if not self.run_id or not self.job_name:
-            return
+def generate_all_flow_name() -> str:
+    return f"scrape-all-{datetime.now():%Y-%m-%d-%H%M}"
 
-        event = RunEvent(
-            eventType=RunState.COMPLETE,
-            eventTime=datetime.now(timezone.utc).isoformat(),
-            run=Run(runId=self.run_id),
-            job=Job(namespace=self.namespace, name=self.job_name),
-            inputs=self._inputs,
-            outputs=self._outputs,
-            producer="https://github.com/masterries/prefecttest",
-            schemaURL="https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
-        )
 
-        self._emit(event)
+@flow(
+    log_prints=True,
+    flow_run_name=generate_all_flow_name
+)
+async def scrape_all_flow(vehicles: list[tuple[str, str]] = VEHICLES) -> None:
+    """Scrape multiple make/model combinations sequentially."""
 
-    def fail_run(self, error_message: str = "") -> None:
-        """Emit a FAIL event."""
-        if not self.run_id or not self.job_name:
-            return
+    # --- Lineage: START ---
+    tracker = LineageTracker()
+    tracker.start_run(
+        job_name="scrape-all",
+        inputs=[],
+        outputs=[
+            "postgres.raw_listings",
+            "postgres.listings",
+            "postgres.price_changes",
+        ],
+    )
 
-        event = RunEvent(
-            eventType=RunState.FAIL,
-            eventTime=datetime.now(timezone.utc).isoformat(),
-            run=Run(runId=self.run_id),
-            job=Job(namespace=self.namespace, name=self.job_name),
-            inputs=self._inputs,
-            outputs=self._outputs,
-            producer="https://github.com/masterries/prefecttest",
-            schemaURL="https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
-        )
+    try:
+        print(f"Starting scrape for {len(vehicles)} vehicle(s).")
+        for make, model in vehicles:
+            print(f"--- {make} {model} ---")
+            await scrape_flow(make=make, model=model)
+        print("All vehicles scraped.")
 
-        self._emit(event)
+        # --- Lineage: COMPLETE ---
+        tracker.complete_run()
 
-    def _emit(self, event: RunEvent) -> None:
-        """Send event to Marquez, silently fail if unavailable."""
-        if not self.client:
-            print(f"[LineageTracker] Skipping event (no client): {event.eventType}")
-            return
-        try:
-            self.client.emit(event)
-            print(f"[LineageTracker] Emitted {event.eventType} for {self.job_name}")
-        except Exception as e:
-            print(f"[LineageTracker] Warning: Failed to emit event: {e}")
+    except Exception as e:
+        # --- Lineage: FAIL ---
+        tracker.fail_run(error_message=str(e))
+        raise
