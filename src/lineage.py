@@ -150,7 +150,6 @@ class LineageTracker:
             inputs=self._inputs,
             outputs=self._outputs,
             producer="https://github.com/masterries/prefecttest",
-            schemaURL="https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
         )
 
         self._emit(event)
@@ -169,7 +168,6 @@ class LineageTracker:
             inputs=self._inputs,
             outputs=self._outputs,
             producer="https://github.com/masterries/prefecttest",
-            schemaURL="https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
         )
 
         self._emit(event)
@@ -187,7 +185,6 @@ class LineageTracker:
             inputs=self._inputs,
             outputs=self._outputs,
             producer="https://github.com/masterries/prefecttest",
-            schemaURL="https://openlineage.io/spec/2-0-2/OpenLineage.json#/$defs/RunEvent",
         )
 
         self._emit(event)
