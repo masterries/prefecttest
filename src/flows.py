@@ -36,14 +36,36 @@ def parse_listings_task(html: str, make: str, model: str) -> list[Listing]:
 
 
 @task
-def persist_listings_task(listings: list[Listing], run_id: str) -> tuple[int, list[PriceChange]]:
+def persist_listings_task(
+    listings: list[Listing], run_id: str, tracker: LineageTracker, make: str, model: str
+) -> tuple[int, list[PriceChange]]:
     con = get_connection()
     try:
         create_tables(con)
-        save_raw_listings(con, listings, run_id)      # Bronze — append-only
-        changes = detect_price_changes(con, listings)  # Silver prep
-        saved = save_listings(con, listings)           # Silver — current state
+
+        # --- Bronze: Web → raw_listings ---
+        tracker.start_run(
+            job_name=f"ingest-bronze-{make}-{model}",
+            inputs=[f"autoscout24.{make}-{model}"],
+            outputs=["postgres.raw_listings"],
+        )
+        save_raw_listings(con, listings, run_id)
+        tracker.complete_run()
+
+        # --- Silver: raw_listings → listings + price_changes ---
+        tracker.start_run(
+            job_name=f"transform-silver-{make}-{model}",
+            inputs=["postgres.raw_listings"],
+            outputs=["postgres.listings", "postgres.price_changes"],
+        )
+        changes = detect_price_changes(con, listings)
+        saved = save_listings(con, listings)
+        tracker.complete_run()
+
         return saved, changes
+    except Exception as e:
+        tracker.fail_run(error_message=str(e))
+        raise
     finally:
         con.close()
 
@@ -56,19 +78,7 @@ async def scrape_flow(make: str, model: str) -> None:
     logger = get_run_logger()
     run_id = str(flow_run.id)
     all_listings: list[Listing] = []
-
-    # --- Lineage: START ---
     tracker = LineageTracker()
-    tracker.start_run(
-        job_name=f"scrape-{make}-{model}",
-        run_id=run_id,
-        inputs=[],
-        outputs=[
-            "postgres.raw_listings",
-            "postgres.listings",
-            "postgres.price_changes",
-        ],
-    )
 
     try:
         page = 1
@@ -86,10 +96,9 @@ async def scrape_flow(make: str, model: str) -> None:
 
         if not all_listings:
             print("No listings found.")
-            tracker.complete_run()
             return
 
-        saved, changes = persist_listings_task(all_listings, run_id)
+        saved, changes = persist_listings_task(all_listings, run_id, tracker, make, model)
         print(f"Saved/updated {saved} listings. Price changes detected: {len(changes)}.")
 
         for ch in changes:
@@ -119,12 +128,7 @@ async def scrape_flow(make: str, model: str) -> None:
                 description=f"{len(changes)} price changes detected",
             )
 
-        # --- Lineage: COMPLETE ---
-        tracker.complete_run()
-
     except Exception as e:
-        # --- Lineage: FAIL ---
-        tracker.fail_run(error_message=str(e))
         raise
 
 
@@ -138,19 +142,6 @@ def generate_all_flow_name() -> str:
 )
 async def scrape_all_flow(vehicles: list[tuple[str, str]] = VEHICLES) -> None:
     """Scrape multiple make/model combinations sequentially."""
-
-    # --- Lineage: START ---
-    tracker = LineageTracker()
-    tracker.start_run(
-        job_name="scrape-all",
-        inputs=[],
-        outputs=[
-            "postgres.raw_listings",
-            "postgres.listings",
-            "postgres.price_changes",
-        ],
-    )
-
     try:
         print(f"Starting scrape for {len(vehicles)} vehicle(s).")
         for make, model in vehicles:
@@ -158,10 +149,5 @@ async def scrape_all_flow(vehicles: list[tuple[str, str]] = VEHICLES) -> None:
             await scrape_flow(make=make, model=model)
         print("All vehicles scraped.")
 
-        # --- Lineage: COMPLETE ---
-        tracker.complete_run()
-
     except Exception as e:
-        # --- Lineage: FAIL ---
-        tracker.fail_run(error_message=str(e))
         raise
